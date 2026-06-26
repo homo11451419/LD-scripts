@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LinuxDo 追觅
 // @namespace    https://linux.do/
-// @version      3.3.2
-// @description  在网页上实时监控 Linux.do 活动。
+// @version      3.4.0
+// @description  在网页上实时监控 Linux.do 活动。(含 Boost 追踪)
 // @author       ChiGamma
 // @license      Fair License
 // @match        https://linux.do/*
@@ -67,9 +67,6 @@
     for (const name in category_dict) category_dict[name].forEach(id => categoryMap.set(id, name));
 
     // --- 状态管理 (使用 GM_getValue 实现跨域持久化) ---
-    // 注意：GM_getValue 是按域名存储的，要在所有网站共享数据很难（除非用云端）。
-    // 这里的策略是：配置仅保存在当前域名下。
-    // 如果需要全网同步配置，需要更复杂的技术（如 iframe 通信），这里暂保持单站独立配置，但代码结构支持扩展。
     function loadConfig() {
         try { return JSON.parse(GM_getValue('ld_v21_config', '{}')); }
         catch { return {}; }
@@ -98,8 +95,7 @@
         enableSysNotify: saved.enableSysNotify !== false,
         enableDanmaku: saved.enableDanmaku !== false,
         data: {},
-        // isCollapsed: GM_getValue('ld_is_collapsed', true), // 默认收起
-        isCollapsed: sessionStorage.getItem('ld_is_collapsed') !== 'false', // 默认收起，每个tab独立
+        isCollapsed: sessionStorage.getItem('ld_is_collapsed') !== 'false',
         isProcessing: false,
         hiddenUsers: new Set(saved.hiddenUsers || []),
         selfUser: getSelfUser(),
@@ -211,7 +207,6 @@
             };
 
             if (isSameOrigin) {
-                // Native Fetch Implementation for Same-Origin
                 const controller = new AbortController();
                 const id = setTimeout(() => controller.abort(), timeout);
 
@@ -253,7 +248,6 @@
                     }
                 }
             } else {
-                // GM_xmlhttpRequest Implementation for Cross-Origin
                 const gmHeaders = {
                     ...baseHeaders,
                     "User-Agent": navigator.userAgent,
@@ -429,10 +423,21 @@
 
         try {
             await wait(CONFIG.THROTTLE_MS);
-            const [jsonActions, jsonReactions] = await Promise.all([
+
+            // 三路并行：动态 + 表情 + Boost，用 allSettled 容错
+            const [resActions, resReactions, resBoosts] = await Promise.allSettled([
                 safeFetch(`${CONFIG.HOST}/user_actions.json?offset=0&limit=${CONFIG.LOG_LIMIT_PER_USER}&username=${username}&filter=1,4,5`, timeout),
-                safeFetch(`${CONFIG.HOST}/discourse-reactions/posts/reactions.json?username=${username}`, timeout)
+                safeFetch(`${CONFIG.HOST}/discourse-reactions/posts/reactions.json?username=${username}`, timeout),
+                safeFetch(`${CONFIG.HOST}/u/${username}/activity/boosts-given.json`, timeout)
             ]);
+
+            const jsonActions = resActions.status === 'fulfilled' ? resActions.value : { user_actions: [] };
+            const jsonReactions = resReactions.status === 'fulfilled' ? resReactions.value : [];
+            const jsonBoosts = resBoosts.status === 'fulfilled' ? resBoosts.value : { user_actions: [] };
+
+            if (resActions.status === 'rejected') log(`[${username}] actions fetch failed: ${resActions.reason?.message}`, 'error');
+            if (resReactions.status === 'rejected') log(`[${username}] reactions fetch failed: ${resReactions.reason?.message}`, 'error');
+            if (resBoosts.status === 'rejected') log(`[${username}] boosts fetch failed: ${resBoosts.reason?.message}`, 'error');
 
             const actions = (jsonActions.user_actions || []).map(action => {
                 if (action.action_type === 1) {
@@ -449,7 +454,15 @@
                 action_type: r.reaction?.reaction_value || 'reaction', reaction_value: r.reaction?.reaction_value
             }));
 
-            return [...actions, ...reactions].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, CONFIG.LOG_LIMIT_PER_USER);
+            // Boost 归一化：标记 action_type 为 'boost'
+            const boosts = (jsonBoosts.user_actions || []).map(b => ({
+                ...b,
+                action_type: 'boost',
+            }));
+
+            return [...actions, ...reactions, ...boosts]
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+                .slice(0, CONFIG.LOG_LIMIT_PER_USER);
         } catch (e) {
             log(`[${username}]: ${e.message}`, 'error');
             return e.status === 429 ? 'RATE_LIMIT' : 'ERROR';
@@ -493,12 +506,14 @@
             reply: '<svg class="fa d-icon d-icon-reply svg-icon svg-string" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 512 512"><path d="M8.309 189.836L184.313 37.851C199.719 24.546 224 35.347 224 56.015v80.053c160.629 1.839 288 34.032 288 186.258 0 61.441-39.581 122.309-83.333 154.132-13.653 9.931-33.111-2.533-28.077-18.631 45.344-145.012-21.507-183.51-176.59-185.742V360c0 20.7-24.3 31.453-39.687 18.164l-176.004-152c-11.071-9.562-11.086-26.753 0-36.328z"/></svg>',
             post: '<svg class="fa d-icon d-icon-pencil svg-icon svg-string" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 512 512"><path d="M497.9 142.1l-46.1 46.1c-4.7 4.7-12.3 4.7-17 0l-111-111c-4.7-4.7-4.7-12.3 0-17l46.1-46.1c18.7-18.7 49.1-18.7 67.9 0l60.1 60.1c18.8 18.7 18.8 49.1 0 67.9zM284.2 99.8L21.6 362.4.4 483.9c-2.9 16.4 11.4 30.6 27.8 27.8l121.5-21.3 262.6-262.6c4.7-4.7 4.7-12.3 0-17l-111-111c-4.8-4.7-12.4-4.7-17.1 0zM88 424h48v36.3l-64.5 11.3-31.1-31.1L51.7 376H88v48z"/></svg>',
             like: '<svg class="fa d-icon d-icon-d-heart svg-icon svg-string" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 640 640"><path fill="#fa6c8d" d="M305 151.1L320 171.8L335 151.1C360 116.5 400.2 96 442.9 96C516.4 96 576 155.6 576 229.1L576 231.7C576 343.9 436.1 474.2 363.1 529.9C350.7 539.3 335.5 544 320 544C304.5 544 289.2 539.4 276.9 529.9C203.9 474.2 64 343.9 64 231.7L64 229.1C64 155.6 123.6 96 197.1 96C239.8 96 280 116.5 305 151.1z"/></svg>',
+            boost: '<svg class="fa d-icon d-icon-rocket svg-icon svg-string" xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 512 512"><path fill="#f7c948" d="M505.1 19.1C503.8 13 499 8.2 492.9 6.9 460.7 0 435.5 0 410.4 0 307.2 0 245.3 55.2 199.1 128H94.9c-18.2 0-34.8 10.3-42.9 26.5L2.6 253.3c-8 16 3.6 34.7 21.5 34.7h95.1c-5.9 12.8-11.9 25.5-18 37.7-3.1 6.2-2.3 13.6 2.1 19l55.1 55.1c5.4 4.4 12.8 5.2 19 2.1 12.2-6.1 24.9-12.1 37.7-18v95.1c0 17.9 18.8 29.5 34.7 21.5l98.7-49.4c16.3-8.1 26.5-24.8 26.5-42.9V301c72.8-46.3 128-108.4 128-211.1.1-25.2.1-50.4-6.8-82.6zM400 160c-26.5 0-48-21.5-48-48s21.5-48 48-48 48 21.5 48 48-21.5 48-48 48zM107.3 462.7c-18.7-18.7-18.7-49.1 0-67.9 3-3 6.4-5.4 10.1-7.3L68.6 436.3c-12.5 12.5-12.5 32.8 0 45.3l11.8 11.8c12.5 12.5 32.8 12.5 45.3 0l48.8-48.8c-1.9 3.7-4.3 7.1-7.3 10.1-18.7 18.7-49.1 18.7-67.9 0z"/></svg>',
         };
         const REACTION_ICONS = {
             "tieba_087": '/uploads/default/original/3X/2/e/2e09f3a3c7b27eacbabe9e9614b06b88d5b06343.png?v=15',
             "bili_057": '/uploads/default/original/3X/1/a/1a9f6c30e88a7901b721fffc1aaeec040f54bdf3.png?v=15'
         };
 
+        if (actionType === 'boost') return ACTION_ICONS.boost;
         if (actionType === 5) return ACTION_ICONS.reply;
         if (actionType === 4) return ACTION_ICONS.post;
         if (actionType === 1) return ACTION_ICONS.like;
@@ -566,7 +581,7 @@
         if (State.enableDanmaku && shadowRoot) {
             const layer = shadowRoot.getElementById('dm-container');
             if (layer) {
-                // Icon pop for likes/reactions
+                // Icon pop for likes/reactions/boosts
                 const isLikeOrReaction = action.action_type === 1 || typeof action.action_type === 'string';
                 const isSelfUser = State.selfUser && action.acting_username.toLowerCase() === State.selfUser.toLowerCase();
                 if (isLikeOrReaction && isSelfUser) {
@@ -848,7 +863,6 @@
             const bar = shadowRoot.getElementById('ld-sidebar');
             bar.classList.toggle('collapsed');
             State.isCollapsed = bar.classList.contains('collapsed');
-            // GM_setValue('ld_is_collapsed', State.isCollapsed);
             sessionStorage.setItem('ld_is_collapsed', State.isCollapsed);
         };
 
@@ -1045,7 +1059,7 @@
         }, 1000);
     }
 
-    // Renders the static structure of sidebar rows. Called ONLY on structure change (add/remove user).
+    // Renders the static structure of sidebar rows.
     function renderSidebarRows() {
         if (!shadowRoot) return;
         const div = shadowRoot.getElementById('sb-tags');
